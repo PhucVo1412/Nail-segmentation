@@ -15,23 +15,31 @@ python main.py <input_image> [output_prefix]
 ```
 
 - Requires `models/hand_landmarker.task` next to the script (pretrained MediaPipe Hand Landmarker model — already present in this repo).
-- Dependencies: `mediapipe`, `opencv-python`, `numpy` — already installed in `.venv`. Activate it or invoke `.venv/Scripts/python.exe` directly.
+- Dependencies: `mediapipe`, `opencv-python`, `numpy` (see `requirements.txt`). `.venv` exists but may need `pip install -r requirements.txt` run into it first — check with `.venv/Scripts/pip.exe list` before assuming it's populated. Activate the venv or invoke `.venv/Scripts/python.exe` directly.
 - Sample input images are in `images/` (`img1.jpg`, `img2.jpg`).
 - Output: `<output_prefix>.jpg` (overlay of detected nail polygons on the original image) and `<output_prefix>.json` (per-finger polygon points, both pixel and normalized coordinates).
 
 There is no build step, test suite, or linter configured in this repo.
 
-## Architecture (pipeline in `main.py`)
+## Architecture
 
-The whole thing is one linear pipeline run per image, per finger:
+Landmark detection + per-finger crop/coordinate-mapping live in **`nail_lib.py`**,
+shared between `main.py` (inference) and the training data-prep scripts
+described in `training_plan.md` — this guarantees a trained model is trained
+on exactly the crops it will see at inference time (same MediaPipe landmarks,
+same crop geometry, same rotation).
 
+`nail_lib.py`:
 1. **`detect_landmarks`** — runs MediaPipe `HandLandmarker` (pretrained) on the full image, returns all 21 hand landmarks in pixel coordinates.
-2. **`crop_finger`** — for one finger, takes the tip landmark and the nearest joint landmark, rotates the *entire original image* around the tip point so the tip→joint axis points straight up, then crops an axis-aligned box around the tip. Returns the crop plus the rotation matrix and crop offset, both needed later to map points back. Key gotcha documented in code: the tip landmark sits ON/mid the nail (not below it), so the crop must extend generously *beyond* the tip too, not just toward the joint — tunable via `UP_FACTOR`/`DOWN_FACTOR`/`WIDTH_FACTOR`.
-3. **`segment_nail`** — **placeholder for a real trained segmentation model** (a mini U-Net/TFLite model, per the proposal in `readme.md`). Currently classical CV: samples the crop's outer ring as a skin-color reference, scores every pixel by color distance (LAB space) from that reference, Otsu-thresholds it for a deterministic seed mask, then refines with `GrabCut` (`GC_INIT_WITH_MASK`). Plain rect-seeded GrabCut was tried first and rejected — its internal GMM/k-means init is randomized, so identical input produced different results across runs; seeding it with a deterministic mask fixed that. Ends with `findContours` + `approxPolyDP` to get a simplified polygon in crop-local coordinates.
-4. **`local_to_image_points`** — maps polygon points from crop-local → rotated-image → original-image coordinates, undoing the crop offset and rotation from step 2 (via `cv2.invertAffineTransform`).
-5. **`main`** — orchestrates the above per finger (`FINGERS` dict maps finger name to MediaPipe tip/joint landmark index pairs), draws overlays, and writes the `.jpg`/`.json` outputs.
+2. **`crop_finger`** — for one finger, takes the tip landmark and the nearest joint landmark, rotates the *entire input image* around the tip point so the tip→joint axis points straight up, then crops an axis-aligned box around the tip. Returns the crop plus the rotation matrix and crop offset, both needed later to map points back. Key gotcha documented in code: the tip landmark sits ON/mid the nail (not below it), so the crop must extend generously *beyond* the tip too, not just toward the joint — tunable via `UP_FACTOR`/`DOWN_FACTOR`/`WIDTH_FACTOR`. Accepts a BGR photo or a single-channel mask (pass `interp=cv2.INTER_NEAREST` for masks) so training data-prep can crop a ground-truth mask the same way as its source photo.
+3. **`local_to_image_points`** — maps polygon points from crop-local → rotated-image → original-image coordinates, undoing the crop offset and rotation from `crop_finger` (via `cv2.invertAffineTransform`).
 
-**When replacing the placeholder with a real model**: only `segment_nail()` should need to change (swap the classical-CV body for a TFLite interpreter call that takes the crop and returns a binary mask) — the crop/rotate and coordinate-mapping logic around it is meant to stay as-is.
+`main.py` (the pipeline, run per image, per finger):
+1. Calls `detect_landmarks` + `crop_finger` from `nail_lib.py`.
+2. **`segment_nail`** — **placeholder for a real trained segmentation model** (a mini U-Net/TFLite model, per the proposal in `readme.md` and the plan in `training_plan.md`). Currently classical CV: samples the crop's outer ring as a skin-color reference, scores every pixel by color distance (LAB space) from that reference, Otsu-thresholds it for a deterministic seed mask, then refines with `GrabCut` (`GC_INIT_WITH_MASK`). Plain rect-seeded GrabCut was tried first and rejected — its internal GMM/k-means init is randomized, so identical input produced different results across runs; seeding it with a deterministic mask fixed that. Ends with `findContours` + `approxPolyDP` to get a simplified polygon in crop-local coordinates.
+3. **`main`** — orchestrates the above per finger (`FINGERS` dict maps finger name to MediaPipe tip/joint landmark index pairs), draws overlays, and writes the `.jpg`/`.json` outputs.
+
+**When replacing the placeholder with a real model**: only `segment_nail()` in `main.py` should need to change (swap the classical-CV body for a TFLite interpreter call that takes the crop and returns a binary mask) — `nail_lib.py` (crop/rotate + coordinate-mapping) is meant to stay as-is and be reused as-is by the training pipeline too.
 
 ## Key context from readme.md
 

@@ -16,38 +16,26 @@ Run:
 Requires: mediapipe, opencv-python, numpy
 Needs models/hand_landmarker.task next to this script (see download note
 at the bottom of this file / the chat message that shipped with this demo).
+
+Landmark detection + per-finger crop/coordinate-mapping live in nail_lib.py,
+shared with the training data-prep scripts (see training_plan.md) so a
+trained model is trained on exactly the crops it sees at inference time.
 """
 
 import sys
 import json
-import math
-from pathlib import Path
 
 import cv2
 import numpy as np
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 
-MODEL_PATH = Path(__file__).parent / "models" / "hand_landmarker.task"
+from nail_lib import (
+    FINGERS,
+    MODEL_PATH,
+    crop_finger,
+    detect_landmarks,
+    local_to_image_points,
+)
 
-# (tip landmark index, nearest-joint landmark index) per finger, per MediaPipe
-# Hands topology: https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker
-FINGERS = {
-    "thumb":  (4, 3),
-    "index":  (8, 7),
-    "middle": (12, 11),
-    "ring":   (16, 15),
-    "pinky":  (20, 19),
-}
-
-# Tunable geometry (fractions of the tip-joint landmark segment length).
-# Note: the tip landmark (4/8/12/16/20) sits ON the nail, not below it -- for
-# long/extension nails it can even be mid-nail -- so the crop must extend
-# generously *beyond* the tip too, not just up to it.
-UP_FACTOR = 0.9        # crop extent beyond the tip landmark (toward the free edge)
-DOWN_FACTOR = 0.6      # crop extent back toward the joint (covers the cuticle/base)
-WIDTH_FACTOR = 0.65    # crop half-width across the finger axis
 GRABCUT_ITERS = 5
 POLY_EPS_FRAC = 0.02   # approxPolyDP epsilon as a fraction of contour perimeter
 
@@ -58,66 +46,6 @@ COLORS = {
     "ring":   (255, 128, 0),
     "pinky":  (255, 0, 0),
 }
-
-
-def detect_landmarks(image_bgr):
-    base_options = mp_python.BaseOptions(model_asset_path=str(MODEL_PATH))
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options,
-        num_hands=1,
-        min_hand_detection_confidence=0.3,
-        min_hand_presence_confidence=0.3,
-        min_tracking_confidence=0.3,
-    )
-    landmarker = vision.HandLandmarker.create_from_options(options)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB,
-                         data=cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
-    result = landmarker.detect(mp_image)
-    if not result.hand_landmarks:
-        return None
-    h, w = image_bgr.shape[:2]
-    pts = result.hand_landmarks[0]
-    return np.array([[p.x * w, p.y * h] for p in pts], dtype=np.float32)
-
-
-def crop_finger(image_bgr, tip, joint):
-    """Rotate the image so the tip-joint axis points straight up, then crop
-    an axis-aligned box around the (overshot) tip. Returns the crop and the
-    inverse-mapping needed to bring local points back to image coordinates."""
-    d = tip - joint
-    seg_len = float(np.linalg.norm(d))
-    if seg_len < 1e-3:
-        return None
-
-    angle_current = math.degrees(math.atan2(d[1], d[0]))  # image coords, y down
-    # we want d to end up pointing to (0, -1) i.e. angle -90
-    rot_deg = -90 - angle_current
-
-    h, w = image_bgr.shape[:2]
-    center = (float(tip[0]), float(tip[1]))
-    M = cv2.getRotationMatrix2D(center, -rot_deg, 1.0)  # cv2: positive = CCW
-    rotated = cv2.warpAffine(image_bgr, M, (w, h), flags=cv2.INTER_LINEAR,
-                              borderMode=cv2.BORDER_REPLICATE)
-
-    # tip stays exactly at `center` after rotation (it's the rotation pivot);
-    # after rotation the finger axis points toward -y, so "beyond the tip"
-    # is smaller y and "back toward the joint" is larger y.
-    cx, cy = center
-    box_w = seg_len * WIDTH_FACTOR
-
-    x0, x1 = int(cx - box_w), int(cx + box_w)
-    y0, y1 = int(cy - seg_len * UP_FACTOR), int(cy + seg_len * DOWN_FACTOR)
-    x0, y0 = max(x0, 0), max(y0, 0)
-    x1, y1 = min(x1, w), min(y1, h)
-    if x1 - x0 < 6 or y1 - y0 < 6:
-        return None
-
-    crop = rotated[y0:y1, x0:x1].copy()
-    return {
-        "crop": crop,
-        "M": M,               # rotation matrix used on the full image
-        "offset": (x0, y0),   # crop origin within the rotated image
-    }
 
 
 def segment_nail(crop):
@@ -173,17 +101,6 @@ def segment_nail(crop):
     peri = cv2.arcLength(largest, True)
     approx = cv2.approxPolyDP(largest, POLY_EPS_FRAC * peri, True)
     return approx.reshape(-1, 2)  # local (x, y) in crop coordinates
-
-
-def local_to_image_points(points_local, offset, M):
-    """crop-local -> rotated-image -> original-image coordinates."""
-    x0, y0 = offset
-    pts_rot = points_local.astype(np.float64) + np.array([x0, y0])
-    Minv = cv2.invertAffineTransform(M)
-    ones = np.ones((pts_rot.shape[0], 1))
-    pts_h = np.hstack([pts_rot, ones])
-    pts_img = pts_h @ Minv.T
-    return pts_img
 
 
 def main():
